@@ -76,6 +76,83 @@ void ShadowIterArgInBodyMap(std::unordered_map<const Var*, VarPtr>& body_map, co
 }
 
 /**
+ * @brief Substitute iter_arg init values and rebuild iter_args with updated types.
+ *
+ * For each iter_arg, substitutes its initValue_ through var_map. If the substituted
+ * init's type differs from the iter_arg's type, creates a new IterArg with the updated
+ * type. Also updates body_map via ShadowIterArgInBodyMap for downstream substitution.
+ *
+ * This pattern is shared by ForStmt and WhileStmt handling in both
+ * TransformIncoreBody and UpdateCallSitesBody.
+ */
+std::vector<IterArgPtr> SubstituteIterArgs(const std::vector<IterArgPtr>& iter_args,
+                                           const std::unordered_map<const Var*, VarPtr>& var_map,
+                                           std::unordered_map<const Var*, VarPtr>& body_map) {
+  std::vector<IterArgPtr> new_iter_args;
+  new_iter_args.reserve(iter_args.size());
+  for (const auto& iter_arg : iter_args) {
+    auto new_init = SubstituteExpr(iter_arg->initValue_, var_map);
+    auto new_ia = iter_arg;
+    if (new_init->GetType() != iter_arg->GetType()) {
+      new_ia = std::make_shared<IterArg>(iter_arg->name_hint_, new_init->GetType(), new_init, iter_arg->span_);
+    } else if (new_init != iter_arg->initValue_) {
+      new_ia = std::make_shared<IterArg>(iter_arg->name_hint_, iter_arg->GetType(), new_init, iter_arg->span_);
+    }
+    new_iter_args.push_back(new_ia);
+    ShadowIterArgInBodyMap(body_map, iter_arg, new_ia);
+  }
+  return new_iter_args;
+}
+
+/**
+ * @brief Update return_vars types to match new types from yield or iter_args.
+ *
+ * Compares each return_var's type against the corresponding new_type. If they differ,
+ * creates a new Var with the updated type and records the mapping in var_map.
+ *
+ * @param return_vars Original return variables from the control flow statement.
+ * @param new_types New types to compare against (from yield types or iter_arg types).
+ * @param var_map Map to update with old→new variable mappings.
+ * @param always_map If true, always maps rv→new_rv (even when type unchanged).
+ *                   Used by TransformIncoreBody where all return vars must be tracked.
+ *                   If false, only maps when type actually changed (UpdateCallSitesBody).
+ */
+std::vector<VarPtr> UpdateReturnVarTypes(const std::vector<VarPtr>& return_vars,
+                                         const std::vector<TypePtr>& new_types,
+                                         std::unordered_map<const Var*, VarPtr>& var_map,
+                                         bool always_map) {
+  std::vector<VarPtr> new_return_vars;
+  new_return_vars.reserve(return_vars.size());
+  for (size_t i = 0; i < return_vars.size(); ++i) {
+    const auto& rv = return_vars[i];
+    if (i < new_types.size() && new_types[i] != rv->GetType()) {
+      auto new_rv = std::make_shared<Var>(rv->name_hint_, new_types[i], rv->span_);
+      new_return_vars.push_back(new_rv);
+      var_map[rv.get()] = new_rv;
+    } else {
+      new_return_vars.push_back(rv);
+      if (always_map) {
+        var_map[rv.get()] = rv;
+      }
+    }
+  }
+  return new_return_vars;
+}
+
+/// Overload for iter_arg-sourced types (ForStmt/WhileStmt return_vars update).
+std::vector<VarPtr> UpdateReturnVarTypes(const std::vector<VarPtr>& return_vars,
+                                         const std::vector<IterArgPtr>& new_iter_args,
+                                         std::unordered_map<const Var*, VarPtr>& var_map,
+                                         bool always_map) {
+  std::vector<TypePtr> types;
+  types.reserve(new_iter_args.size());
+  for (const auto& ia : new_iter_args) {
+    types.push_back(ia->GetType());
+  }
+  return UpdateReturnVarTypes(return_vars, types, var_map, always_map);
+}
+
+/**
  * @brief Visitor that collects tensor-typed variable names used directly by converted ops.
  *
  * Traverses the IR tree via IRVisitor and records the name of every Var/IterArg argument
@@ -87,7 +164,7 @@ void ShadowIterArgInBodyMap(std::unordered_map<const Var*, VarPtr>& body_map, co
  * non-converted ops (e.g. tile.load, tile.move) already manage their own tile
  * representation and must NOT get an extra load inserted.
  *
- * Also excludes parameters used by tensor.slice and tensor.matmul since those conversions
+ * Also excludes parameters used by tensor.slice and tensor matmul-family ops since those conversions
  * create their own block.load with proper offsets/memory spaces.
  */
 class TensorArgsInConvertedOpsCollector : public IRVisitor {
@@ -128,9 +205,9 @@ class TensorArgsInConvertedOpsCollector : public IRVisitor {
       // Skip ops that manage their own data loading (they create block.load
       // with specific offsets/memory-spaces during conversion, so an extra
       // Phase-1 default Vec load would be redundant or wrong).
-      static const std::unordered_set<std::string> kSelfLoadingOps = {"tensor.slice",      "tensor.matmul",
-                                                                      "tensor.matmul_acc", "tensor.assemble",
-                                                                      "tensor.read",       "tensor.write"};
+      static const std::unordered_set<std::string> kSelfLoadingOps = {
+          "tensor.slice", "tensor.matmul", "tensor.batch_matmul", "tensor.matmul_acc",
+          "tensor.assemble", "tensor.read", "tensor.write"};
       if (kSelfLoadingOps.count(call->op_->name_)) {
         IRVisitor::VisitStmt_(op);
         return;
@@ -397,22 +474,25 @@ std::unordered_map<std::string, IterArgMapping> AnalyzeIterArgMappings(
 }
 
 /**
- * @brief Info about a tensor.slice result that feeds into a tensor.matmul/tensor.matmul_acc operand.
+ * @brief Info about a tensor.slice result that feeds into a tensor matmul-family operand.
  *
- * When a tensor.slice result is consumed by tensor.matmul or tensor.matmul_acc, the slice conversion
- * should produce tile.load(Mat, transpose=...) instead of tile.load(Vec) so that
- * the matmul conversion can skip the load and directly use the Mat-space tile.
+ * When a tensor.slice result is consumed by tensor.matmul, tensor.batch_matmul, or tensor.matmul_acc,
+ * the slice conversion should produce tile.load(Mat, transpose=...) instead of tile.load(Vec) so that
+ * the downstream matmul conversion can skip the load and directly use the Mat-space tile.
+ *
+ * tensor.batch_matmul keeps transpose intent as explicit tile.transpose operands around
+ * tile.batch_matmul, so slice loads feeding tensor.batch_matmul only move data into Mat space
+ * and do not pre-transpose the slice.
  */
 struct MatmulSliceInfo {
-  bool is_rhs;     ///< true if the slice result is the rhs operand of matmul
   bool transpose;  ///< transpose flag from matmul (b_trans for rhs, a_trans for lhs)
 };
 
 /**
- * @brief Pre-scan statements to find tensor.slice results consumed by tensor.matmul/tensor.matmul_acc.
+ * @brief Pre-scan statements to find tensor.slice results consumed by tensor matmul-family ops.
  *
  * Scans a flat list of statements to build a map from slice result variable names
- * to their matmul usage info (which side and transpose flag).
+ * to their matmul usage info (whether the slice load should pre-transpose).
  */
 std::unordered_map<const Var*, MatmulSliceInfo> PreScanSliceMatmulPatterns(
     const std::vector<StmtPtr>& stmts) {
@@ -434,11 +514,12 @@ std::unordered_map<const Var*, MatmulSliceInfo> PreScanSliceMatmulPatterns(
     auto assign = As<AssignStmt>(stmt);
     if (!assign) continue;
     auto call = As<Call>(assign->value_);
-    if (!call || (call->op_->name_ != "tensor.matmul" && call->op_->name_ != "tensor.matmul_acc")) {
+    if (!call || (call->op_->name_ != "tensor.matmul" && call->op_->name_ != "tensor.batch_matmul" &&
+                  call->op_->name_ != "tensor.matmul_acc")) {
       continue;
     }
 
-    // tensor.matmul: args = [lhs, rhs]
+    // tensor.matmul / tensor.batch_matmul: args = [lhs, rhs]
     // tensor.matmul_acc: args = [acc, lhs, rhs]
     bool is_acc = (call->op_->name_ == "tensor.matmul_acc");
     size_t lhs_idx = is_acc ? 1 : 0;
@@ -451,16 +532,17 @@ std::unordered_map<const Var*, MatmulSliceInfo> PreScanSliceMatmulPatterns(
       if (k == "a_trans") a_trans = std::any_cast<bool>(v);
       if (k == "b_trans") b_trans = std::any_cast<bool>(v);
     }
+    const bool pretranspose_slice = (call->op_->name_ != "tensor.batch_matmul");
 
     if (auto lhs_var = As<Var>(call->args_[lhs_idx])) {
       if (slice_results.count(lhs_var.get())) {
-        result[lhs_var.get()] = MatmulSliceInfo{false, a_trans};
+        result[lhs_var.get()] = MatmulSliceInfo{pretranspose_slice && a_trans};
       }
     }
 
     if (auto rhs_var = As<Var>(call->args_[rhs_idx])) {
       if (slice_results.count(rhs_var.get())) {
-        result[rhs_var.get()] = MatmulSliceInfo{true, b_trans};
+        result[rhs_var.get()] = MatmulSliceInfo{pretranspose_slice && b_trans};
       }
     }
   }
@@ -549,18 +631,8 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
       if (yield_types.empty() && new_else_body.has_value()) {
         yield_types = FindYieldTypes(FlattenToStmts(*new_else_body));
       }
-      std::vector<VarPtr> new_return_vars;
-      new_return_vars.reserve(if_stmt->return_vars_.size());
-      for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
-        const auto& rv = if_stmt->return_vars_[i];
-        if (i < yield_types.size() && yield_types[i] != rv->GetType()) {
-          auto new_rv = std::make_shared<Var>(rv->name_hint_, yield_types[i], rv->span_);
-          new_return_vars.push_back(new_rv);
-          tensor_to_tile[rv.get()] = new_rv;
-        } else {
-          new_return_vars.push_back(rv);
-        }
-      }
+      auto new_return_vars =
+          UpdateReturnVarTypes(if_stmt->return_vars_, yield_types, tensor_to_tile, /*always_map=*/true);
 
       result.push_back(std::make_shared<IfStmt>(new_condition, new_then_body, new_else_body, new_return_vars,
                                                 if_stmt->span_));
@@ -573,42 +645,16 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
       auto new_stop = SubstituteExpr(for_stmt->stop_, tensor_to_tile);
       auto new_step = SubstituteExpr(for_stmt->step_, tensor_to_tile);
 
-      // Process iter_args: substitute initValue_, update types if changed
       auto body_map = tensor_to_tile;
-      std::vector<IterArgPtr> new_iter_args;
-      new_iter_args.reserve(for_stmt->iter_args_.size());
-      for (const auto& iter_arg : for_stmt->iter_args_) {
-        auto new_init = SubstituteExpr(iter_arg->initValue_, tensor_to_tile);
-        auto new_ia = iter_arg;
-        if (new_init->GetType() != iter_arg->GetType()) {
-          new_ia =
-              std::make_shared<IterArg>(iter_arg->name_hint_, new_init->GetType(), new_init, iter_arg->span_);
-        } else if (new_init != iter_arg->initValue_) {
-          new_ia =
-              std::make_shared<IterArg>(iter_arg->name_hint_, iter_arg->GetType(), new_init, iter_arg->span_);
-        }
-        new_iter_args.push_back(new_ia);
-        ShadowIterArgInBodyMap(body_map, iter_arg, new_ia);
-      }
+      auto new_iter_args = SubstituteIterArgs(for_stmt->iter_args_, tensor_to_tile, body_map);
 
       // Recurse into body
       auto body_stmts = FlattenToStmts(for_stmt->body_);
       auto new_body_stmts = TransformIncoreBody(body_stmts, body_map, conv_registry, op_registry, span);
       auto new_body = SeqStmts::Flatten(std::move(new_body_stmts), for_stmt->body_->span_);
 
-      // Update return_vars types to match iter_arg types
-      std::vector<VarPtr> new_return_vars;
-      new_return_vars.reserve(for_stmt->return_vars_.size());
-      for (size_t i = 0; i < for_stmt->return_vars_.size(); ++i) {
-        const auto& rv = for_stmt->return_vars_[i];
-        if (i < new_iter_args.size() && new_iter_args[i]->GetType() != rv->GetType()) {
-          auto new_rv = std::make_shared<Var>(rv->name_hint_, new_iter_args[i]->GetType(), rv->span_);
-          new_return_vars.push_back(new_rv);
-          tensor_to_tile[rv.get()] = new_rv;
-        } else {
-          new_return_vars.push_back(rv);
-        }
-      }
+      auto new_return_vars =
+          UpdateReturnVarTypes(for_stmt->return_vars_, new_iter_args, tensor_to_tile, /*always_map=*/true);
 
       result.push_back(std::make_shared<ForStmt>(for_stmt->loop_var_, new_start, new_stop, new_step,
                                                  new_iter_args, new_body, new_return_vars, for_stmt->span_,
@@ -619,23 +665,8 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
 
     // WhileStmt: recurse into body
     if (auto while_stmt = As<WhileStmt>(stmt)) {
-      // Process iter_args: substitute initValue_, update types if changed
       auto body_map = tensor_to_tile;
-      std::vector<IterArgPtr> new_iter_args;
-      new_iter_args.reserve(while_stmt->iter_args_.size());
-      for (const auto& iter_arg : while_stmt->iter_args_) {
-        auto new_init = SubstituteExpr(iter_arg->initValue_, tensor_to_tile);
-        auto new_ia = iter_arg;
-        if (new_init->GetType() != iter_arg->GetType()) {
-          new_ia =
-              std::make_shared<IterArg>(iter_arg->name_hint_, new_init->GetType(), new_init, iter_arg->span_);
-        } else if (new_init != iter_arg->initValue_) {
-          new_ia =
-              std::make_shared<IterArg>(iter_arg->name_hint_, iter_arg->GetType(), new_init, iter_arg->span_);
-        }
-        new_iter_args.push_back(new_ia);
-        ShadowIterArgInBodyMap(body_map, iter_arg, new_ia);
-      }
+      auto new_iter_args = SubstituteIterArgs(while_stmt->iter_args_, tensor_to_tile, body_map);
 
       // Substitute condition using body_map (condition references iter_arg values)
       auto new_condition = SubstituteExpr(while_stmt->condition_, body_map);
@@ -645,19 +676,8 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
       auto new_body_stmts = TransformIncoreBody(body_stmts, body_map, conv_registry, op_registry, span);
       auto new_body = SeqStmts::Flatten(std::move(new_body_stmts), while_stmt->body_->span_);
 
-      // Update return_vars types to match iter_arg types
-      std::vector<VarPtr> new_return_vars;
-      new_return_vars.reserve(while_stmt->return_vars_.size());
-      for (size_t i = 0; i < while_stmt->return_vars_.size(); ++i) {
-        const auto& rv = while_stmt->return_vars_[i];
-        if (i < new_iter_args.size() && new_iter_args[i]->GetType() != rv->GetType()) {
-          auto new_rv = std::make_shared<Var>(rv->name_hint_, new_iter_args[i]->GetType(), rv->span_);
-          new_return_vars.push_back(new_rv);
-          tensor_to_tile[rv.get()] = new_rv;
-        } else {
-          new_return_vars.push_back(rv);
-        }
-      }
+      auto new_return_vars =
+          UpdateReturnVarTypes(while_stmt->return_vars_, new_iter_args, tensor_to_tile, /*always_map=*/true);
 
       result.push_back(std::make_shared<WhileStmt>(new_condition, new_iter_args, new_body, new_return_vars,
                                                    while_stmt->span_));
@@ -685,7 +705,8 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
             for (const auto& prologue_stmt : transformed_prologue) {
               result.push_back(prologue_stmt);
             }
-            result.push_back(std::make_shared<EvalStmt>(conv_result.result, eval_stmt->span_));
+            auto converted_result = SubstituteExpr(conv_result.result, tensor_to_tile);
+            result.push_back(std::make_shared<EvalStmt>(converted_result, eval_stmt->span_));
             continue;
           }
         }
@@ -762,7 +783,7 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
       substituted_args.push_back(SubstituteExpr(arg, tensor_to_tile));
     }
 
-    // Special handling: tensor.slice feeding into tensor.matmul
+    // Special handling: tensor.slice feeding into tensor matmul-family ops
     // Generate tile.load(Mat, transpose=xx) instead of the default tile.load(Vec)
     if (call->op_->name_ == "tensor.slice" && matmul_slice_targets.count(assign->var_.get())) {
       const auto& info = matmul_slice_targets.at(assign->var_.get());
@@ -802,9 +823,20 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
       result.push_back(prologue_stmt);
     }
 
+    // Apply tensor→tile variable substitution to the conversion result so that
+    // any references to already-converted tensor vars are replaced. When the
+    // substituted result is itself just a Var (pure alias, e.g. LoadOperandToMat
+    // returned an already-TileType operand unchanged), record the alias directly
+    // in tensor_to_tile without emitting a redundant AssignStmt.
+    auto converted_result = SubstituteExpr(conv_result.result, tensor_to_tile);
+    if (auto converted_var = As<Var>(converted_result)) {
+      tensor_to_tile[assign->var_.get()] = converted_var;
+      continue;
+    }
+
     std::string tile_name = MakeTileValueName(assign->var_->name_hint_);
-    auto tile_var = std::make_shared<Var>(tile_name, conv_result.result->GetType(), assign->var_->span_);
-    result.push_back(std::make_shared<AssignStmt>(tile_var, conv_result.result, assign->span_));
+    auto tile_var = std::make_shared<Var>(tile_name, converted_result->GetType(), assign->var_->span_);
+    result.push_back(std::make_shared<AssignStmt>(tile_var, converted_result, assign->span_));
     tensor_to_tile[assign->var_.get()] = tile_var;
   }
 
@@ -934,6 +966,35 @@ bool StmtUsesVar(const StmtPtr& stmt, const Var* target) {
   VarUseVisitor visitor(target);
   visitor.CheckStmt(stmt);
   return visitor.Found();
+}
+
+class UsedVarCollector : public IRVisitor {
+ public:
+  [[nodiscard]] const std::unordered_set<const Var*>& GetUsed() const { return used_; }
+
+  void CollectStmt(const StmtPtr& stmt) {
+    if (!stmt) return;
+    VisitStmt(stmt);
+  }
+
+ protected:
+  void VisitVarLike_(const VarPtr& op) override { used_.insert(op.get()); }
+
+  void VisitExpr_(const IterArgPtr& op) override { VisitVarLike_(op); }
+
+ private:
+  std::unordered_set<const Var*> used_;
+};
+
+/// Collect all Var nodes referenced (read) by the given statements.
+/// Used to determine which Out params are actually used in the function body,
+/// so that unused Out params can be reused as store targets for return values.
+std::unordered_set<const Var*> CollectUsedVars(const std::vector<StmtPtr>& stmts) {
+  UsedVarCollector collector;
+  for (const auto& stmt : stmts) {
+    collector.CollectStmt(stmt);
+  }
+  return collector.GetUsed();
 }
 
 using ParamOrigins = std::vector<size_t>;
@@ -1543,7 +1604,47 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func,
   std::vector<ParamDirection> new_param_directions = func->param_directions_;
   std::vector<TypePtr> new_return_types;
   size_t num_added_outputs = 0;
+  // Collect reusable tensor output params for matching with return values.
+  // IterArg InOut returns are stored back to the existing InOut param instead
+  // of creating a new Out param. Plain Out params are only reused when they
+  // are otherwise unused in the function body.
+  std::unordered_map<std::string, VarPtr> inout_param_by_base;
+  std::unordered_map<std::string, VarPtr> reusable_out_param_by_base;
+  std::vector<VarPtr> reusable_out_params;
+  std::unordered_set<const Var*> claimed_out_params;
+  size_t next_reusable_out_param = 0;
+  auto used_vars_in_body = CollectUsedVars(non_return_stmts);
+  for (size_t i = 0; i < func->params_.size(); ++i) {
+    if (!As<TensorType>(func->params_[i]->GetType())) {
+      continue;
+    }
+    if (func->param_directions_[i] == ParamDirection::InOut) {
+      inout_param_by_base[auto_name::GetBaseName(func->params_[i]->name_hint_)] = func->params_[i];
+      continue;
+    }
+    if (func->param_directions_[i] != ParamDirection::Out) {
+      continue;
+    }
+    if (used_vars_in_body.count(func->params_[i].get()) == 0) {
+      reusable_out_params.push_back(func->params_[i]);
+      reusable_out_param_by_base[auto_name::GetBaseName(func->params_[i]->name_hint_)] = func->params_[i];
+    }
+  }
 
+  auto claim_existing_out_param = [&](const VarPtr& candidate) -> VarPtr {
+    if (!candidate) return nullptr;
+    return claimed_out_params.insert(candidate.get()).second ? candidate : nullptr;
+  };
+
+  auto claim_next_reusable_out_param = [&]() -> VarPtr {
+    while (next_reusable_out_param < reusable_out_params.size()) {
+      auto candidate = reusable_out_params[next_reusable_out_param++];
+      if (claimed_out_params.insert(candidate.get()).second) {
+        return candidate;
+      }
+    }
+    return nullptr;
+  };
   if (return_stmt) {
     std::vector<ExprPtr> new_return_exprs;
 
@@ -1579,11 +1680,35 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func,
           continue;
         }
 
-        // Add output tensor parameter
-        std::string out_name = MakeOutParamName(num_added_outputs);
-        auto out_param = std::make_shared<Var>(out_name, orig_tensor_type, span);
-        new_params.push_back(out_param);
-        new_param_directions.push_back(ParamDirection::Out);
+        // Determine target param: reuse existing InOut/Out param or create new Out param.
+        VarPtr out_param;
+        bool created_new_output_param = false;
+        auto orig_ret_var = As<Var>(return_stmt->value_[i]);
+        if (orig_ret_var) {
+          std::string ret_base = auto_name::GetBaseName(orig_ret_var->name_hint_);
+          auto inout_it = inout_param_by_base.find(ret_base);
+          if (inout_it != inout_param_by_base.end()) {
+            out_param = inout_it->second;
+            inout_param_by_base.erase(inout_it);
+          }
+          if (!out_param) {
+            auto out_it = reusable_out_param_by_base.find(ret_base);
+            if (out_it != reusable_out_param_by_base.end()) {
+              out_param = claim_existing_out_param(out_it->second);
+            }
+          }
+        }
+        if (!out_param) {
+          out_param = claim_next_reusable_out_param();
+        }
+        if (!out_param) {
+          // Add new output tensor parameter
+          std::string out_name = MakeOutParamName(num_added_outputs);
+          out_param = std::make_shared<Var>(out_name, orig_tensor_type, span);
+          new_params.push_back(out_param);
+          new_param_directions.push_back(ParamDirection::Out);
+          created_new_output_param = true;
+        }
 
         if (auto loop_rewrite = RewriteReturnedAssembleLoopToStore(new_stmts, ret_expr, out_param,
                                                                    orig_tensor_type, op_registry)) {
@@ -1594,7 +1719,7 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func,
           }
           new_return_types.push_back(orig_tensor_type);
           new_return_exprs.push_back(loop_rewrite->new_return_var);
-          ++num_added_outputs;
+          if (created_new_output_param) ++num_added_outputs;
           continue;
         }
 
@@ -1602,13 +1727,12 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func,
         auto offsets = MakeZeroOffsets(tile_type->shape_.size(), span);
         auto store_call = op_registry.Create("tile.store", {ret_expr, offsets, out_param}, span);
 
-        auto store_var =
-            std::make_shared<Var>(MakeStoreResultName(num_added_outputs), store_call->GetType(), span);
+        auto store_var = std::make_shared<Var>(MakeStoreResultName(i), store_call->GetType(), span);
         new_stmts.push_back(std::make_shared<AssignStmt>(store_var, store_call, span));
 
         new_return_types.push_back(store_call->GetType());
         new_return_exprs.push_back(store_var);
-        ++num_added_outputs;
+        if (created_new_output_param) ++num_added_outputs;
       } else {
         // Non-tile return values pass through
         new_return_types.push_back(ret_expr->GetType());
@@ -1724,18 +1848,8 @@ std::vector<StmtPtr> UpdateCallSitesBody(
       if (yield_types.empty() && new_else_body.has_value()) {
         yield_types = FindYieldTypes(FlattenToStmts(*new_else_body));
       }
-      std::vector<VarPtr> new_return_vars;
-      new_return_vars.reserve(if_stmt->return_vars_.size());
-      for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
-        const auto& rv = if_stmt->return_vars_[i];
-        if (i < yield_types.size() && yield_types[i] != rv->GetType()) {
-          auto new_rv = std::make_shared<Var>(rv->name_hint_, yield_types[i], rv->span_);
-          new_return_vars.push_back(new_rv);
-          var_map[rv.get()] = new_rv;
-        } else {
-          new_return_vars.push_back(rv);
-        }
-      }
+      auto new_return_vars =
+          UpdateReturnVarTypes(if_stmt->return_vars_, yield_types, var_map, /*always_map=*/false);
 
       result.push_back(std::make_shared<IfStmt>(new_condition, new_then_body, new_else_body, new_return_vars,
                                                 if_stmt->span_));
@@ -1749,39 +1863,15 @@ std::vector<StmtPtr> UpdateCallSitesBody(
       auto new_step = SubstituteExpr(for_stmt->step_, var_map);
 
       auto body_map = var_map;
-      std::vector<IterArgPtr> new_iter_args;
-      new_iter_args.reserve(for_stmt->iter_args_.size());
-      for (const auto& iter_arg : for_stmt->iter_args_) {
-        auto new_init = SubstituteExpr(iter_arg->initValue_, var_map);
-        auto new_ia = iter_arg;
-        if (new_init->GetType() != iter_arg->GetType()) {
-          new_ia =
-              std::make_shared<IterArg>(iter_arg->name_hint_, new_init->GetType(), new_init, iter_arg->span_);
-        } else if (new_init != iter_arg->initValue_) {
-          new_ia =
-              std::make_shared<IterArg>(iter_arg->name_hint_, iter_arg->GetType(), new_init, iter_arg->span_);
-        }
-        new_iter_args.push_back(new_ia);
-        ShadowIterArgInBodyMap(body_map, iter_arg, new_ia);
-      }
+      auto new_iter_args = SubstituteIterArgs(for_stmt->iter_args_, var_map, body_map);
 
       auto body_stmts = FlattenToStmts(for_stmt->body_);
       auto new_body_stmts = UpdateCallSitesBody(body_stmts, body_map, incore_added_outputs,
                                                 transformed_incore_funcs, op_registry, span, changed);
       auto new_body = SeqStmts::Flatten(std::move(new_body_stmts), for_stmt->body_->span_);
 
-      std::vector<VarPtr> new_return_vars;
-      new_return_vars.reserve(for_stmt->return_vars_.size());
-      for (size_t i = 0; i < for_stmt->return_vars_.size(); ++i) {
-        const auto& rv = for_stmt->return_vars_[i];
-        if (i < new_iter_args.size() && new_iter_args[i]->GetType() != rv->GetType()) {
-          auto new_rv = std::make_shared<Var>(rv->name_hint_, new_iter_args[i]->GetType(), rv->span_);
-          new_return_vars.push_back(new_rv);
-          var_map[rv.get()] = new_rv;
-        } else {
-          new_return_vars.push_back(rv);
-        }
-      }
+      auto new_return_vars =
+          UpdateReturnVarTypes(for_stmt->return_vars_, new_iter_args, var_map, /*always_map=*/false);
 
       result.push_back(std::make_shared<ForStmt>(for_stmt->loop_var_, new_start, new_stop, new_step,
                                                  new_iter_args, new_body, new_return_vars, for_stmt->span_,
@@ -1793,21 +1883,7 @@ std::vector<StmtPtr> UpdateCallSitesBody(
     // WhileStmt: recurse into body
     if (auto while_stmt = As<WhileStmt>(stmt)) {
       auto body_map = var_map;
-      std::vector<IterArgPtr> new_iter_args;
-      new_iter_args.reserve(while_stmt->iter_args_.size());
-      for (const auto& iter_arg : while_stmt->iter_args_) {
-        auto new_init = SubstituteExpr(iter_arg->initValue_, var_map);
-        auto new_ia = iter_arg;
-        if (new_init->GetType() != iter_arg->GetType()) {
-          new_ia =
-              std::make_shared<IterArg>(iter_arg->name_hint_, new_init->GetType(), new_init, iter_arg->span_);
-        } else if (new_init != iter_arg->initValue_) {
-          new_ia =
-              std::make_shared<IterArg>(iter_arg->name_hint_, iter_arg->GetType(), new_init, iter_arg->span_);
-        }
-        new_iter_args.push_back(new_ia);
-        ShadowIterArgInBodyMap(body_map, iter_arg, new_ia);
-      }
+      auto new_iter_args = SubstituteIterArgs(while_stmt->iter_args_, var_map, body_map);
 
       auto new_condition = SubstituteExpr(while_stmt->condition_, body_map);
 
@@ -1816,18 +1892,8 @@ std::vector<StmtPtr> UpdateCallSitesBody(
                                                 transformed_incore_funcs, op_registry, span, changed);
       auto new_body = SeqStmts::Flatten(std::move(new_body_stmts), while_stmt->body_->span_);
 
-      std::vector<VarPtr> new_return_vars;
-      new_return_vars.reserve(while_stmt->return_vars_.size());
-      for (size_t i = 0; i < while_stmt->return_vars_.size(); ++i) {
-        const auto& rv = while_stmt->return_vars_[i];
-        if (i < new_iter_args.size() && new_iter_args[i]->GetType() != rv->GetType()) {
-          auto new_rv = std::make_shared<Var>(rv->name_hint_, new_iter_args[i]->GetType(), rv->span_);
-          new_return_vars.push_back(new_rv);
-          var_map[rv.get()] = new_rv;
-        } else {
-          new_return_vars.push_back(rv);
-        }
-      }
+      auto new_return_vars =
+          UpdateReturnVarTypes(while_stmt->return_vars_, new_iter_args, var_map, /*always_map=*/false);
 
       result.push_back(std::make_shared<WhileStmt>(new_condition, new_iter_args, new_body, new_return_vars,
                                                    while_stmt->span_));

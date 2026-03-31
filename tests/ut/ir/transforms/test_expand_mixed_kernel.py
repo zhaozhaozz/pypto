@@ -3047,6 +3047,5 @@ class TestDCERegression:
         # tpop_from_aic must appear before the add that uses its result
         assert aiv_str.index("pl.tile.tpop_from_aic") < aiv_str.index("pl.tile.add(")
 
-
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

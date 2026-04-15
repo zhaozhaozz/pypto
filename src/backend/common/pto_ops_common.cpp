@@ -111,6 +111,81 @@ static const std::vector<std::string> round_modes = {"NONE", "RINT",  "ROUND", "
 static const std::vector<std::string> mask_patterns = {"",      "P0101", "P1010", "P0001",
                                                        "P0010", "P0100", "P1000", "P1111"};
 
+// Build a partition_tensor_view type string from dimension strings and element dtype.
+static std::string MakePartitionTensorViewType(const std::vector<std::string>& dims,
+                                               const std::string& dtype_str) {
+  std::ostringstream oss;
+  oss << "!pto.partition_tensor_view<";
+  for (size_t i = 0; i < dims.size(); ++i) {
+    if (i > 0) oss << "x";
+    oss << dims[i];
+  }
+  oss << "x" << dtype_str << ">";
+  return oss.str();
+}
+
+// Convert expressions to MLIR operand strings.
+static std::vector<std::string> GetExprCodes(const std::vector<ir::ExprPtr>& exprs,
+                                             codegen::PTOCodegen& codegen) {
+  std::vector<std::string> codes;
+  codes.reserve(exprs.size());
+  for (const auto& expr : exprs) {
+    codes.push_back(codegen.GetExprAsCode(expr));
+  }
+  return codes;
+}
+
+// Convert statically-known dimensions to plain integer strings for MLIR types.
+static std::vector<std::string> GetStaticDimStrings(const std::vector<ir::ExprPtr>& exprs,
+                                                    codegen::PTOCodegen& codegen) {
+  std::vector<std::string> dims;
+  dims.reserve(exprs.size());
+  for (const auto& expr : exprs) {
+    dims.push_back(std::to_string(codegen.GetConstIntValue(expr)));
+  }
+  return dims;
+}
+
+// Convert statically-known dimensions to index-typed MLIR constants.
+static std::vector<std::string> GetStaticIndexCodes(const std::vector<ir::ExprPtr>& exprs,
+                                                    codegen::PTOCodegen& codegen) {
+  std::vector<std::string> codes;
+  codes.reserve(exprs.size());
+  for (const auto& expr : exprs) {
+    codes.push_back(codegen.GetOrEmitConstant(codegen.GetConstIntValue(expr), DataType::INDEX));
+  }
+  return codes;
+}
+
+// Emit a pto.partition_view op and return the generated SSA name.
+// The caller decides whether source/result ranks match; the ND batch_matmul path
+// uses this helper for "ND source view -> 2D partition result" emission.
+static std::string EmitPartitionViewPTO(const std::string& name_hint, const std::string& tensor_view,
+                                        const std::string& tensor_view_type,
+                                        const std::string& partition_type,
+                                        const std::vector<std::string>& offset_codes,
+                                        const std::vector<std::string>& size_codes,
+                                        codegen::PTOCodegen& codegen) {
+  std::string partition_view = codegen.NewNamedTemp(name_hint + "_pview");
+  std::ostringstream oss;
+  oss << partition_view << " = pto.partition_view " << tensor_view;
+  oss << ", offsets = [";
+  for (size_t i = 0; i < offset_codes.size(); ++i) {
+    if (i > 0) oss << ", ";
+    oss << offset_codes[i];
+  }
+  oss << "]";
+  oss << ", sizes = [";
+  for (size_t i = 0; i < size_codes.size(); ++i) {
+    if (i > 0) oss << ", ";
+    oss << size_codes[i];
+  }
+  oss << "]";
+  oss << " : " << tensor_view_type << " -> " << partition_type;
+  codegen.Emit(oss.str());
+  return partition_view;
+}
+
 // Helper function for input & output generation (with type annotations)
 static std::string GenerateInsOutsClause(const CallPtr& op, codegen::PTOCodegen& codegen,
                                          const std::string& config_attr = "") {
@@ -525,54 +600,62 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
 
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
   std::string tile_buf_type = codegen.GetCurrentResultTileBufTypeString();
-  // Build partition type with all ND dimensions to match the sizes attribute.
-  // For DN layout, swap the last two shape elements (same as offsets) so that
-  // sizes are in the transposed coordinate system used by make_tensor_view.
+
   bool is_dn =
       tensor_type->tensor_view_.has_value() && tensor_type->tensor_view_->layout == ir::TensorLayout::DN;
-  auto shape_elems = shapes_tuple->elements_;
-  if (is_dn && shape_elems.size() >= 2) {
-    std::iter_swap(shape_elems.rbegin(), shape_elems.rbegin() + 1);
-  }
-  std::string partition_type = "!pto.partition_tensor_view<";
-  for (size_t i = 0; i < ndim; ++i) {
-    if (i > 0) partition_type += "x";
-    partition_type += std::to_string(codegen.GetConstIntValue(shape_elems[i]));
-  }
-  partition_type += "x" + dtype_str + ">";
 
-  std::string partition_view = codegen.NewNamedTemp(tensor->name_hint_ + "_pview");
-  std::ostringstream partition_line;
-  partition_line << partition_view << " = pto.partition_view " << tensor_view;
+  if (tensor_type->shape_.size() > 2 && !is_dn) {
+    // ND tensor path: keep the source window in ND coordinates, but emit a 2D
+    // partition result because FlattenTileNdTo2D has already merged the leading
+    // dimensions into tile rows. PTOAS allows the partition_view result rank to
+    // differ from the source tensor_view rank.
+    auto shape_elems = shapes_tuple->elements_;
+    auto offset_elems = offsets_tuple->elements_;
 
-  // For DN layout, swap the last two offset elements so that the partition
-  // base address is in the transposed coordinate system used by make_tensor_view.
-  // With the "original coordinates" DSL convention, offsets are always written in
-  // the tensor's declared coordinate system, so a swap is always needed for DN.
-  auto offset_elems = offsets_tuple->elements_;
-  if (is_dn && offset_elems.size() >= 2) {
-    std::iter_swap(offset_elems.rbegin(), offset_elems.rbegin() + 1);
-  }
+    // Compute 2D result partition type: merged_rows x last_dim
+    int64_t part_rows = 1;
+    for (size_t i = 0; i < ndim - 1; ++i) {
+      part_rows *= codegen.GetConstIntValue(shape_elems[i]);
+    }
+    int64_t part_cols = codegen.GetConstIntValue(shape_elems[ndim - 1]);
+    std::string partition_type =
+        MakePartitionTensorViewType({std::to_string(part_rows), std::to_string(part_cols)}, dtype_str);
+    std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
+                                                      partition_type, GetExprCodes(offset_elems, codegen),
+                                                      GetStaticIndexCodes(shape_elems, codegen), codegen);
 
-  partition_line << ", offsets = [";
-  for (size_t i = 0; i < offset_elems.size(); ++i) {
-    if (i > 0) partition_line << ", ";
-    partition_line << codegen.GetExprAsCode(offset_elems[i]);
-  }
-  partition_line << "]";
-  partition_line << ", sizes = [";
-  for (size_t i = 0; i < shape_elems.size(); ++i) {
-    if (i > 0) partition_line << ", ";
-    partition_line << codegen.GetOrEmitConstant(codegen.GetConstIntValue(shape_elems[i]), DataType::INDEX);
-  }
-  partition_line << "]";
-  partition_line << " : " << tensor_view_type << " -> " << partition_type;
-  codegen.Emit(partition_line.str());
+    std::ostringstream tload_line;
+    tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
+    tload_line << tile_buf << " : " << tile_buf_type << ")";
+    codegen.Emit(tload_line.str());
+  } else {
+    // Standard path for 1D/2D tensors and all DN tensors.
+    // DN keeps the existing coordinate-system contract: swap the trailing
+    // shape/offset axes here so partition_view sees the same visible trailing
+    // dimensions as the DN make_tensor_view emitted earlier.
+    auto shape_elems = shapes_tuple->elements_;
+    if (is_dn && shape_elems.size() >= 2) {
+      std::iter_swap(shape_elems.rbegin(), shape_elems.rbegin() + 1);
+    }
 
-  std::ostringstream tload_line;
-  tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
-  tload_line << tile_buf << " : " << tile_buf_type << ")";
-  codegen.Emit(tload_line.str());
+    // For DN layout, swap the last two offset elements so that the partition
+    // base address is in the transposed coordinate system used by make_tensor_view.
+    auto offset_elems = offsets_tuple->elements_;
+    if (is_dn && offset_elems.size() >= 2) {
+      std::iter_swap(offset_elems.rbegin(), offset_elems.rbegin() + 1);
+    }
+
+    std::string partition_type =
+        MakePartitionTensorViewType(GetStaticDimStrings(shape_elems, codegen), dtype_str);
+    std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
+                                                      partition_type, GetExprCodes(offset_elems, codegen),
+                                                      GetStaticIndexCodes(shape_elems, codegen), codegen);
+
+    std::ostringstream tload_line;
+    tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
+    tload_line << tile_buf << " : " << tile_buf_type << ")";
+    codegen.Emit(tload_line.str());
+  }
 
   // Emit pto.set_validshape after tload only when a fillpad consumer exists.
   // Physical dims were used for alloc_tile (correct DMA stride); set_validshape
@@ -649,52 +732,48 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
   std::string tile_buf_type = codegen.GetExprTypeAnnotation(op->args_[0]);
 
   std::string partition_view = codegen.NewNamedTemp(output_tensor->name_hint_ + "_pview");
-  std::ostringstream partition_line;
-  partition_line << partition_view << " = pto.partition_view " << tensor_view;
-  // Use all offsets elements to match tensor_view rank (handles ND tensors)
-  partition_line << ", offsets = [";
-  for (size_t i = 0; i < offsets_tuple->elements_.size(); ++i) {
-    if (i > 0) partition_line << ", ";
-    partition_line << codegen.GetExprAsCode(offsets_tuple->elements_[i]);
-  }
-  partition_line << "]";
-  partition_line << ", sizes = [";
-
-  // Build partition_type and sizes to match the tensor rank so they are consistent.
   std::string partition_type;
   const size_t tensor_rank = tensor_type->shape_.size();
-  if (tensor_rank > 2) {
-    // Use the explicit shapes tuple (args[3]) injected by FlattenTileNdTo2D.
-    // Signature: (tile, offsets, output_tensor[, shapes]) — shapes at args[3]
-    // when 4 args total.
-    INTERNAL_CHECK_SPAN(op->args_.size() > 3, op->span_)
-        << "tile.store on ND tensor requires shapes tuple (args[3])";
-    auto shapes_tuple = As<ir::MakeTuple>(op->args_[3]);
-    INTERNAL_CHECK_SPAN(shapes_tuple, op->span_) << "tile.store args[3] must be a shapes MakeTuple";
-    partition_type = "!pto.partition_tensor_view<";
-    for (size_t i = 0; i < shapes_tuple->elements_.size(); ++i) {
-      if (i > 0) partition_line << ", ";
-      if (auto c = As<ir::ConstInt>(shapes_tuple->elements_[i])) {
-        partition_line << codegen.GetOrEmitConstant(c->value_, DataType::INDEX);
-        if (i > 0) partition_type += "x";
-        partition_type += std::to_string(c->value_);
-      } else {
-        partition_line << codegen.GetExprAsCode(shapes_tuple->elements_[i]);
-        if (i > 0) partition_type += "x";
-        partition_type += "?";
-      }
-    }
-    partition_type += "x" + dtype_str + ">";
-  } else {
+
+  bool is_dn =
+      tensor_type->tensor_view_.has_value() && tensor_type->tensor_view_->layout == ir::TensorLayout::DN;
+
+  if (tensor_rank > 2 && !is_dn) {
+    // ND tensor path: keep ND offsets/sizes for the destination window, but
+    // emit a 2D partition result because tile.store always writes a 2D tile.
+    // PTOAS allows the partition_view result rank to differ from the source rank.
+    auto offset_elems = offsets_tuple->elements_;
+
+    // The partition result type matches the 2D tile buffer shape.
     std::string height_dim = "?", width_dim = "?";
     if (auto h = As<ir::ConstInt>(valid_shape[0])) height_dim = std::to_string(h->value_);
     if (auto w = As<ir::ConstInt>(valid_shape[1])) width_dim = std::to_string(w->value_);
-    partition_type = "!pto.partition_tensor_view<" + height_dim + "x" + width_dim + "x" + dtype_str + ">";
-    partition_line << height_code << ", " << width_code;
+    partition_type = MakePartitionTensorViewType({height_dim, width_dim}, dtype_str);
+
+    // sizes still describe the ND destination window; only the result type is 2D.
+    std::vector<std::string> size_codes;
+    // Use the ND window shape injected by FlattenTileNdTo2D when available.
+    if (op->args_.size() >= 4) {
+      auto shapes_tuple = As<ir::MakeTuple>(op->args_[3]);
+      if (shapes_tuple) {
+        size_codes = GetStaticIndexCodes(shapes_tuple->elements_, codegen);
+      }
+    } else {
+      size_codes = {height_code, width_code};
+    }
+    partition_view =
+        EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
+                             GetExprCodes(offset_elems, codegen), size_codes, codegen);
+  } else {
+    // Standard 1D/2D path (also used for DN layout tensors)
+    std::string height_dim = "?", width_dim = "?";
+    if (auto h = As<ir::ConstInt>(valid_shape[0])) height_dim = std::to_string(h->value_);
+    if (auto w = As<ir::ConstInt>(valid_shape[1])) width_dim = std::to_string(w->value_);
+    partition_type = MakePartitionTensorViewType({height_dim, width_dim}, dtype_str);
+    partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
+                                          partition_type, GetExprCodes(offsets_tuple->elements_, codegen),
+                                          {height_code, width_code}, codegen);
   }
-  partition_line << "]";
-  partition_line << " : " << tensor_view_type << " -> " << partition_type;
-  codegen.Emit(partition_line.str());
 
   std::ostringstream tstore_line;
   tstore_line << "pto.tstore ins(" << tile_buf;
